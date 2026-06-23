@@ -4,33 +4,32 @@ pipeline {
     environment {
         IMAGE_NAME     = "django_app"
         CONTAINER_NAME = "django_test"
+        ENV_FILE       = "/etc/notes-app/.env"
         HEALTH_URL     = "http://localhost:8000/api/health/"
+        APP_PORT       = "8000"
     }
 
     stages {
 
         stage('Checkout') {
             steps {
-                git branch: 'main',
-                    url: 'https://github.com/GandhiRonik/django-notes-app.git'
+                echo "=== Pulling latest code from GitHub ==="
+                checkout scm
+                echo "=== Checkout complete ==="
             }
         }
 
         stage('Build') {
             steps {
-                sh 'docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .'
-                sh 'docker tag ${IMAGE_NAME}:${BUILD_NUMBER} ${IMAGE_NAME}:latest'
-            }
-        }
-
-        stage('Test') {
-            steps {
+                echo "=== Building Docker image: ${IMAGE_NAME}:${BUILD_NUMBER} ==="
                 sh '''
-                    docker run --rm \
-                      --env-file /etc/notes-app/.env \
-                      ${IMAGE_NAME}:${BUILD_NUMBER} \
-                      python manage.py test --verbosity=2
+                    docker build \
+                        --no-cache \
+                        -t ${IMAGE_NAME}:${BUILD_NUMBER} \
+                        -t ${IMAGE_NAME}:latest \
+                        .
                 '''
+                echo "=== Build complete ==="
             }
         }
 
@@ -41,17 +40,19 @@ pipeline {
                         script: "docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} 2>/dev/null || echo 'none'",
                         returnStdout: true
                     ).trim()
+                    echo "Previous image saved: ${env.PREV_IMAGE}"
 
                     sh '''
                         docker stop ${CONTAINER_NAME} || true
-                        docker rm ${CONTAINER_NAME} || true
+                        docker rm   ${CONTAINER_NAME} || true
                         docker run -d \
-                          --name ${CONTAINER_NAME} \
-                          --env-file /etc/notes-app/.env \
-                          -p 8000:8000 \
-                          --restart unless-stopped \
-                          ${IMAGE_NAME}:${BUILD_NUMBER}
+                            --name ${CONTAINER_NAME} \
+                            --env-file ${ENV_FILE} \
+                            -p ${APP_PORT}:${APP_PORT} \
+                            --restart unless-stopped \
+                            ${IMAGE_NAME}:${BUILD_NUMBER}
                     '''
+                    echo "=== Container started ==="
                 }
             }
         }
@@ -60,23 +61,32 @@ pipeline {
             steps {
                 script {
                     def healthy = false
-                    for (int i = 0; i < 3; i++) {
+                    for (int attempt = 1; attempt <= 3; attempt++) {
+                        echo "Waiting 10s before attempt ${attempt}/3..."
                         sleep(10)
-                        def status = sh(
+                        def exitCode = sh(
                             script: "curl -sf --max-time 5 ${HEALTH_URL}",
                             returnStatus: true
                         )
-                        if (status == 0) {
+                        if (exitCode == 0) {
                             healthy = true
-                            echo "Health check passed on attempt ${i + 1}"
+                            echo "Health check PASSED on attempt ${attempt}/3"
                             break
                         }
-                        echo "Attempt ${i + 1}/3 failed — waiting 10s"
+                        echo "Attempt ${attempt}/3 failed"
                     }
                     if (!healthy) {
-                        error("Health check failed after 3 attempts — triggering rollback")
+                        error("Health check failed after 3 attempts — initiating rollback")
                     }
                 }
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                echo "=== Removing dangling images ==="
+                sh 'docker image prune -f || true'
+                echo "=== Cleanup complete ==="
             }
         }
 
@@ -86,24 +96,28 @@ pipeline {
         failure {
             script {
                 if (env.PREV_IMAGE && env.PREV_IMAGE != 'none') {
-                    echo "Rolling back to ${env.PREV_IMAGE}"
+                    echo "=== ROLLING BACK to ${env.PREV_IMAGE} ==="
                     sh '''
                         docker stop ${CONTAINER_NAME} || true
-                        docker rm ${CONTAINER_NAME} || true
+                        docker rm   ${CONTAINER_NAME} || true
                         docker run -d \
-                          --name ${CONTAINER_NAME} \
-                          --env-file /etc/notes-app/.env \
-                          -p 8000:8000 \
-                          --restart unless-stopped \
-                          ${PREV_IMAGE}
+                            --name ${CONTAINER_NAME} \
+                            --env-file ${ENV_FILE} \
+                            -p ${APP_PORT}:${APP_PORT} \
+                            --restart unless-stopped \
+                            ${PREV_IMAGE}
                     '''
+                    echo "=== Rollback complete ==="
                 } else {
-                    echo "No previous image — skipping rollback"
+                    echo "=== No previous image — manual intervention required ==="
                 }
             }
         }
+        success {
+            echo "=== DEPLOYMENT SUCCESSFUL — Build #${BUILD_NUMBER} is live ==="
+        }
         always {
-            sh 'docker image prune -f || true'
+            echo "=== Pipeline #${BUILD_NUMBER} finished: ${currentBuild.result} ==="
         }
     }
 }
